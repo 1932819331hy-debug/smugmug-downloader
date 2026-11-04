@@ -109,6 +109,39 @@ def authenticate() -> OAuth1Session:
     )
 
 
+def _image_filenames(images: list) -> dict[str, str]:
+    """Assign stable, distinct names to images with colliding original filenames."""
+    filenames = {}
+    keys_by_name = {}
+    for image in images:
+        image_key = image.get('ImageKey', 'unknown')
+        if image_key == 'unknown':
+            continue
+        filename = image.get('FileName', f"image_{image_key}")
+        filenames[image_key] = filename
+        keys_by_name.setdefault(filename.casefold(), set()).add(image_key)
+
+    # Reserve original names as well as generated ones, including on filesystems
+    # that treat names differing only in case as the same path.
+    used_names = {name.casefold() for name in filenames.values()}
+    for image_key, filename in sorted(filenames.items()):
+        if len(keys_by_name[filename.casefold()]) < 2:
+            continue
+        original = Path(filename)
+        key_suffix = ''.join(
+            c for c in image_key if c.isascii() and c.isalnum()
+        ) or 'image'
+        stem = f"{original.stem}-{key_suffix}"
+        candidate = str(original.with_name(f"{stem}{original.suffix}"))
+        number = 2
+        while candidate.casefold() in used_names:
+            candidate = str(original.with_name(f"{stem}-{number}{original.suffix}"))
+            number += 1
+        filenames[image_key] = candidate
+        used_names.add(candidate.casefold())
+    return filenames
+
+
 class SmugMugDownloader:
     """Downloads all files from a SmugMug user."""
 
@@ -286,9 +319,11 @@ class SmugMugDownloader:
         skipped = 0
         failed = 0
 
+        filenames = _image_filenames(images)
         for image in images:
             image_key = image.get('ImageKey', 'unknown')            
-            filename = image.get('FileName', f"image_{image_key}")
+            original_filename = image.get('FileName', f"image_{image_key}")
+            filename = filenames.get(image_key, original_filename)
             filepath = album_path / filename
 
 
@@ -296,7 +331,9 @@ class SmugMugDownloader:
                 skipped += 1
                 console.print(f"  [dim]Skipping (unknown)[/dim]")
                 continue
-            if image_key in cachepath.read_text().splitlines():
+            if image_key in cachepath.read_text().splitlines() and (
+                filename == original_filename or filepath.exists()
+            ):
                 skipped += 1
                 console.print(f"  [dim]Skipping (cached): {filepath.name}[/dim]")
                 continue

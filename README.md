@@ -41,6 +41,13 @@ uv run smugmug-downloader feldroy <username> --output /path/to/downloads
 
 The default output directory is `downloads/`.
 
+When different images in an album share a filename (including case-only
+differences), their filenames include the image key, such as `photo-A.jpg` and
+`photo-B.jpg`. Additional numeric suffixes avoid collisions with other original
+filenames. The names are stable across repeated downloads and API ordering.
+Existing files with the old, unsuffixed name are kept; missing copies with the
+new names are downloaded even if an older run already cached their image keys.
+
 ## Authentication
 
 On first run, the tool will:
