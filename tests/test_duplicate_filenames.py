@@ -301,6 +301,50 @@ class DuplicateFilenameTests(unittest.TestCase):
         })
         self.session.get.assert_called_once_with(self.url("A"), stream=True)
 
+    def test_maximum_length_ascii_filename_saves_both_payloads(self):
+        filename = "p" * 251 + ".jpg"
+        self.add_image("A", filename, b"first photo")
+        self.add_image("B", filename, b"second photo")
+        self.download()
+        self.assertEqual(set(self.files().values()), {b"first photo", b"second photo"})
+        self.assertTrue(all(len(name.encode("utf-8")) <= 255 for name in self.files()))
+        self.assertTrue(all(name.endswith(".jpg") for name in self.files()))
+
+    def test_maximum_length_unicode_filename_keeps_characters_and_stable_names(self):
+        filename = "旅" * 83 + "ab.jpg"
+        self.add_image("A", filename, b"first photo")
+        self.add_image("B", filename, b"second photo")
+        self.download()
+        first_files = self.files()
+        self.assertEqual(set(first_files.values()), {b"first photo", b"second photo"})
+        for name in first_files:
+            self.assertLessEqual(len(name.encode("utf-8")), 255)
+            self.assertTrue(name.endswith(".jpg"))
+            self.assertNotIn("\ufffd", name)
+        self.images.reverse()
+        self.session.get.reset_mock()
+        self.download()
+        self.assertEqual(self.files(), first_files)
+        self.session.get.assert_not_called()
+
+    def test_long_key_and_extension_leave_room_for_distinct_destinations(self):
+        filename = "p." + "e" * 253
+        self.add_image("A" * 300, filename, b"first photo")
+        self.add_image("A" * 299 + "B", filename, b"second photo")
+        self.download()
+        self.assertEqual(set(self.files().values()), {b"first photo", b"second photo"})
+        self.assertTrue(all(len(name.encode("utf-8")) <= 255 for name in self.files()))
+
+    def test_truncated_name_counter_growth_stays_within_filename_limit(self):
+        filename = "p" * 251 + ".jpg"
+        for index in range(12):
+            self.add_image("A" + "/" * index, filename, f"photo {index}".encode())
+        self.download()
+        self.assertEqual(set(self.files().values()), set(self.payloads.values()))
+        self.assertEqual(len(self.files()), 12)
+        self.assertTrue(all(len(name.encode("utf-8")) <= 255 for name in self.files()))
+        self.assertTrue(all(name.endswith(".jpg") for name in self.files()))
+
 
 if __name__ == "__main__":
     unittest.main()

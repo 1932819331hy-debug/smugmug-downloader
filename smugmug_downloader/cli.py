@@ -2,6 +2,8 @@
 """SmugMug file downloader - downloads all files from a user's account."""
 
 import json
+import os
+from hashlib import sha256
 from os import getenv, replace
 from pathlib import Path
 from tempfile import NamedTemporaryFile
@@ -114,6 +116,18 @@ def authenticate() -> OAuth1Session:
 FILENAME_MAP = '.smugmug-filenames.json'
 
 
+def _filename_with_suffix(original: Path, suffix: str, limit: int) -> str:
+    """Fit a generated basename in a byte budget without splitting UTF-8."""
+    available = limit - len(suffix.encode('utf-8'))
+    if available < 0:
+        raise ValueError("Image filename suffix exceeds the filesystem name limit")
+    extension_budget = max(0, available - len(original.stem[:1].encode('utf-8')))
+    extension = original.suffix.encode('utf-8')[:extension_budget].decode('utf-8', 'ignore')
+    stem_budget = available - len(extension.encode('utf-8'))
+    stem = original.stem.encode('utf-8')[:stem_budget].decode('utf-8', 'ignore')
+    return f"{stem}{suffix}{extension}"
+
+
 def _image_filenames(images: list, album_path: Path) -> dict[str, str]:
     """Return persistent filename overrides for images needing distinct names."""
     map_path = album_path / FILENAME_MAP
@@ -153,6 +167,12 @@ def _image_filenames(images: list, album_path: Path) -> dict[str, str]:
     owned_names = {name.casefold() for name in assigned.values()} | {FILENAME_MAP.casefold()}
     used_names = (owned_names | {name.casefold() for name in filenames.values()}
                   | {path.name.casefold() for path in album_path.iterdir()})
+    try:
+        name_limit = os.pathconf(album_path, 'PC_NAME_MAX')
+    except (AttributeError, OSError, ValueError):
+        name_limit = 255  # Conservative UTF-8 budget when pathconf is unavailable.
+    if name_limit < 1:
+        name_limit = 255
     for image_key, filename in sorted(filenames.items()):
         if image_key in assigned:
             continue
@@ -162,11 +182,13 @@ def _image_filenames(images: list, album_path: Path) -> dict[str, str]:
         key_suffix = ''.join(
             c for c in image_key if c.isascii() and c.isalnum()
         ) or 'image'
-        stem = f"{original.stem}-{key_suffix}"
-        candidate = f"{stem}{original.suffix}"
+        key_budget = max(1, min(32, name_limit // 4))
+        if len(key_suffix) > key_budget:
+            key_suffix = sha256(image_key.encode('utf-8')).hexdigest()[:min(16, key_budget)]
+        candidate = _filename_with_suffix(original, f"-{key_suffix}", name_limit)
         number = 2
         while candidate.casefold() in used_names:
-            candidate = f"{stem}-{number}{original.suffix}"
+            candidate = _filename_with_suffix(original, f"-{key_suffix}-{number}", name_limit)
             number += 1
         assigned[image_key] = candidate
         used_names.add(candidate.casefold())

@@ -47,6 +47,7 @@ differences), their filenames include the image key, such as `photo-A.jpg` and
 filenames and existing local files. A per-album `.smugmug-filenames.json` file
 remembers these names as images are added, removed, or reordered; keep it with
 the album. Invalid filename maps stop the download without replacing the map.
+Long generated names are shortened to fit the filesystem's filename limit.
 Existing files with the old, unsuffixed name are kept; missing copies with the
 new names are downloaded even if an older run already cached their image keys.
 
