@@ -44,7 +44,9 @@ The default output directory is `downloads/`.
 When different images in an album share a filename (including case-only
 differences), their filenames include the image key, such as `photo-A.jpg` and
 `photo-B.jpg`. Additional numeric suffixes avoid collisions with other original
-filenames. The names are stable across repeated downloads and API ordering.
+filenames and existing local files. A per-album `.smugmug-filenames.json` file
+remembers these names as images are added, removed, or reordered; keep it with
+the album. Invalid filename maps stop the download without replacing the map.
 Existing files with the old, unsuffixed name are kept; missing copies with the
 new names are downloaded even if an older run already cached their image keys.
 

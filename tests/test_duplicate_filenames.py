@@ -2,6 +2,7 @@
 
 from contextlib import ExitStack
 import importlib.util
+import json
 import os
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -36,6 +37,7 @@ class DuplicateFilenameTests(unittest.TestCase):
         spec = importlib.util.spec_from_file_location("_smugmug_filename_test", CLI_PATH)
         cli = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(cli)
+        self.cli = cli
         stack.enter_context(patch.object(
             cli, "authenticate", side_effect=AssertionError("Authentication forbidden"),
         ))
@@ -76,7 +78,8 @@ class DuplicateFilenameTests(unittest.TestCase):
         )
 
     def files(self):
-        return {path.name: path.read_bytes() for path in self.album.iterdir()}
+        return {path.name: path.read_bytes() for path in self.album.iterdir()
+                if path.name != ".smugmug-filenames.json"}
 
     def test_distinct_images_with_same_filename_are_both_saved(self):
         self.add_image("A", "photo.jpg", b"first photo")
@@ -161,6 +164,135 @@ class DuplicateFilenameTests(unittest.TestCase):
         self.add_image("A", "photo.jpg", b"first photo")
         self.add_image("B", "photo.jpg", b"second photo")
         self.download()
+        (self.album / "photo-A.jpg").unlink()
+        self.session.get.reset_mock()
+        self.download()
+        self.assertEqual(self.files(), {
+            "photo-A.jpg": b"first photo", "photo-B.jpg": b"second photo",
+        })
+        self.session.get.assert_called_once_with(self.url("A"), stream=True)
+
+    def test_new_original_name_cannot_take_a_previous_generated_destination(self):
+        self.add_image("A", "photo.jpg", b"first photo")
+        self.add_image("B", "photo.jpg", b"second photo")
+        self.download()
+        first_files = self.files()
+        self.add_image("C", "photo-A.jpg", b"third photo")
+        self.images.reverse()
+        self.download()
+        self.assertEqual(self.files(), {
+            **first_files, "photo-A-C.jpg": b"third photo",
+        })
+        self.session.get.reset_mock()
+        self.download()
+        self.session.get.assert_not_called()
+
+    def test_removed_image_keeps_ownership_when_another_image_reuses_its_name(self):
+        self.add_image("A", "photo.jpg", b"first photo")
+        self.add_image("B", "photo.jpg", b"second photo")
+        self.download()
+        removed = self.images.pop(0)
+        self.add_image("C", "photo-A.jpg", b"third photo")
+        self.download()
+        self.assertEqual(self.files(), {
+            "photo-A.jpg": b"first photo", "photo-B.jpg": b"second photo",
+            "photo-A-C.jpg": b"third photo",
+        })
+        self.images.append(removed)
+        self.images.reverse()
+        self.session.get.reset_mock()
+        self.download()
+        self.session.get.assert_not_called()
+
+    def test_existing_generated_path_is_preserved_and_not_assumed_to_be_ours(self):
+        self.add_image("A", "photo.jpg", b"first photo")
+        self.add_image("B", "photo.jpg", b"second photo")
+        self.album.mkdir()
+        (self.album / "photo-A.jpg").write_bytes(b"unrelated local file")
+        self.download()
+        self.assertEqual(self.files(), {
+            "photo-A.jpg": b"unrelated local file",
+            "photo-A-2.jpg": b"first photo", "photo-B.jpg": b"second photo",
+        })
+
+    def test_missing_map_preserves_old_files_and_recovers_both_images(self):
+        self.add_image("A", "photo.jpg", b"first photo")
+        self.add_image("B", "photo.jpg", b"second photo")
+        self.download()
+        first_files = self.files()
+        (self.album / ".smugmug-filenames.json").unlink()
+        self.download()
+        self.assertEqual(self.files(), {
+            **first_files, "photo-A-2.jpg": b"first photo",
+            "photo-B-2.jpg": b"second photo",
+        })
+
+    def test_map_name_is_reserved_even_for_an_original_filename(self):
+        self.add_image("A", ".smugmug-filenames.json", b"photo contents")
+        self.download()
+        self.assertEqual(self.files(), {".smugmug-filenames-A.json": b"photo contents"})
+        self.session.get.reset_mock()
+        self.download()
+        self.session.get.assert_not_called()
+
+    def test_invalid_map_is_not_overwritten_and_downloads_do_not_start(self):
+        self.add_image("A", "photo.jpg", b"first photo")
+        self.add_image("B", "photo.jpg", b"second photo")
+        self.album.mkdir()
+        metadata = self.album / ".smugmug-filenames.json"
+        invalid = ["unrelated local file", "{}"]
+        for filenames in (
+            {"A": "../outside.jpg"}, {"A": "/outside.jpg"},
+            {"A": "sub\\outside.jpg"}, {"A": ".smugmug-filenames.json"},
+            {"A": "photo.jpg", "B": "PHOTO.jpg"}, {"A": 17},
+        ):
+            invalid.append(json.dumps({"version": 1, "filenames": filenames}))
+        for contents in invalid:
+            with self.subTest(contents=contents):
+                metadata.write_text(contents)
+                with self.assertRaisesRegex(ValueError, "Invalid filename map"):
+                    self.download()
+                self.assertEqual(metadata.read_text(), contents)
+                self.assertEqual(self.cache.read_text(), "")
+                self.session.get.assert_not_called()
+
+    def test_map_replace_failure_preserves_prior_mapping_and_cache(self):
+        self.add_image("A", "photo.jpg", b"first photo")
+        self.add_image("B", "photo.jpg", b"second photo")
+        self.download()
+        metadata = self.album / ".smugmug-filenames.json"
+        old_map, old_cache, old_files = metadata.read_bytes(), self.cache.read_bytes(), self.files()
+        self.add_image("C", "photo-A.jpg", b"third photo")
+        self.session.get.reset_mock()
+        with patch.object(self.cli, "replace", side_effect=OSError("map write failed")):
+            with self.assertRaisesRegex(OSError, "map write failed"):
+                self.download()
+        self.assertEqual(metadata.read_bytes(), old_map)
+        self.assertEqual(self.cache.read_bytes(), old_cache)
+        self.assertEqual(self.files(), old_files)
+        self.session.get.assert_not_called()
+        self.download()
+        self.assertIn(b"third photo", self.files().values())
+
+    def test_map_symlink_does_not_write_to_its_target(self):
+        self.add_image("A", "photo.jpg", b"first photo")
+        self.add_image("B", "photo.jpg", b"second photo")
+        self.album.mkdir()
+        outside = self.root / "outside.json"
+        contents = '{"version": 1, "filenames": {}}'
+        outside.write_text(contents)
+        (self.album / ".smugmug-filenames.json").symlink_to(outside)
+        with self.assertRaisesRegex(ValueError, "Invalid filename map"):
+            self.download()
+        self.assertEqual(outside.read_text(), contents)
+        self.assertEqual(self.cache.read_text(), "")
+        self.session.get.assert_not_called()
+
+    def test_renamed_source_still_recovers_a_missing_owned_copy(self):
+        self.add_image("A", "photo.jpg", b"first photo")
+        self.add_image("B", "photo.jpg", b"second photo")
+        self.download()
+        self.images[0]["FileName"] = "photo-A.jpg"
         (self.album / "photo-A.jpg").unlink()
         self.session.get.reset_mock()
         self.download()

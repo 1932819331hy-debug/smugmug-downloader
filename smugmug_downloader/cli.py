@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """SmugMug file downloader - downloads all files from a user's account."""
 
-from os import getenv
+import json
+from os import getenv, replace
 from pathlib import Path
+from tempfile import NamedTemporaryFile
 from urllib.parse import urljoin
 import typer
 
@@ -109,8 +111,33 @@ def authenticate() -> OAuth1Session:
     )
 
 
-def _image_filenames(images: list) -> dict[str, str]:
-    """Assign stable, distinct names to images with colliding original filenames."""
+FILENAME_MAP = '.smugmug-filenames.json'
+
+
+def _image_filenames(images: list, album_path: Path) -> dict[str, str]:
+    """Return persistent filename overrides for images needing distinct names."""
+    map_path = album_path / FILENAME_MAP
+    assigned = {}
+    if map_path.is_symlink():
+        raise ValueError(f"Invalid filename map: {map_path}")
+    if map_path.exists():
+        try:
+            data = json.loads(map_path.read_text())
+            if (not isinstance(data, dict) or set(data) != {'version', 'filenames'}
+                    or type(data['version']) is not int or data['version'] != 1
+                    or not isinstance(data['filenames'], dict)):
+                raise ValueError
+            assigned = data['filenames']
+            for key, name in assigned.items():
+                if (not key or key == 'unknown' or not isinstance(name, str)
+                        or not name or name in {'.', '..'} or '/' in name or '\\' in name
+                        or '\x00' in name or name.casefold() == FILENAME_MAP.casefold()):
+                    raise ValueError
+            if len({name.casefold() for name in assigned.values()}) != len(assigned):
+                raise ValueError
+        except (ValueError, UnicodeError) as error:
+            raise ValueError(f"Invalid filename map: {map_path}") from error
+    previous = assigned.copy()
     filenames = {}
     keys_by_name = {}
     for image in images:
@@ -121,25 +148,42 @@ def _image_filenames(images: list) -> dict[str, str]:
         filenames[image_key] = filename
         keys_by_name.setdefault(filename.casefold(), set()).add(image_key)
 
-    # Reserve original names as well as generated ones, including on filesystems
-    # that treat names differing only in case as the same path.
-    used_names = {name.casefold() for name in filenames.values()}
+    # Removed images retain ownership. Existing files without a recorded owner
+    # must not be mistaken for successful downloads of a generated name.
+    owned_names = {name.casefold() for name in assigned.values()} | {FILENAME_MAP.casefold()}
+    used_names = (owned_names | {name.casefold() for name in filenames.values()}
+                  | {path.name.casefold() for path in album_path.iterdir()})
     for image_key, filename in sorted(filenames.items()):
-        if len(keys_by_name[filename.casefold()]) < 2:
+        if image_key in assigned:
             continue
-        original = Path(filename)
+        if len(keys_by_name[filename.casefold()]) < 2 and filename.casefold() not in owned_names:
+            continue
+        original = Path(filename.replace('\\', '_').replace('\x00', '_'))
         key_suffix = ''.join(
             c for c in image_key if c.isascii() and c.isalnum()
         ) or 'image'
         stem = f"{original.stem}-{key_suffix}"
-        candidate = str(original.with_name(f"{stem}{original.suffix}"))
+        candidate = f"{stem}{original.suffix}"
         number = 2
         while candidate.casefold() in used_names:
-            candidate = str(original.with_name(f"{stem}-{number}{original.suffix}"))
+            candidate = f"{stem}-{number}{original.suffix}"
             number += 1
-        filenames[image_key] = candidate
+        assigned[image_key] = candidate
         used_names.add(candidate.casefold())
-    return filenames
+
+    # Persist ownership before touching image files or cache entries. A failed
+    # replacement leaves the prior map intact and prevents downloads from starting.
+    if assigned != previous:
+        temporary_path = None
+        try:
+            with NamedTemporaryFile(mode='w', encoding='utf-8', dir=album_path, delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+                json.dump({'version': 1, 'filenames': assigned}, temporary, sort_keys=True)
+            replace(temporary_path, map_path)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+    return assigned
 
 
 class SmugMugDownloader:
@@ -312,6 +356,7 @@ class SmugMugDownloader:
 
         console.print(f"\n[bold]Album: {album_name}[/bold] ({len(images)} files)")
         album_path.mkdir(parents=True, exist_ok=True)
+        filenames = _image_filenames(images, album_path)
 
         download_task = progress.add_task(f"[green]Downloading {album_name}...", total=len(images))
 
@@ -319,7 +364,6 @@ class SmugMugDownloader:
         skipped = 0
         failed = 0
 
-        filenames = _image_filenames(images)
         for image in images:
             image_key = image.get('ImageKey', 'unknown')            
             original_filename = image.get('FileName', f"image_{image_key}")
@@ -332,7 +376,7 @@ class SmugMugDownloader:
                 console.print(f"  [dim]Skipping (unknown)[/dim]")
                 continue
             if image_key in cachepath.read_text().splitlines() and (
-                filename == original_filename or filepath.exists()
+                image_key not in filenames or filepath.exists()
             ):
                 skipped += 1
                 console.print(f"  [dim]Skipping (cached): {filepath.name}[/dim]")
